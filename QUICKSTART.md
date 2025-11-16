@@ -167,9 +167,89 @@ Predictions JSON format:
 }
 ```
 
+## Evaluation
+
+### Compute ST-IoU Metrics
+
+```bash
+# Using main CLI
+python -m src.main eval \
+  --predictions outputs/predictions/predictions.json \
+  --annotations data/train/annotations/annotations.json \
+  --verbose \
+  --output outputs/evaluation_results.json
+
+# Or use dedicated script
+python scripts/eval_st_iou.py \
+  --predictions outputs/predictions/predictions.json \
+  --annotations data/train/annotations/annotations.json \
+  --verbose
+```
+
+## Visualization
+
+### Visualize Ground Truth Annotations
+
+```bash
+python scripts/visualize_annotations.py \
+  --video data/train/samples/Backpack_0/drone_video.mp4 \
+  --annotations data/train/annotations/annotations.json \
+  --video_id Backpack_0 \
+  --output outputs/debug_viz/Backpack_0_gt.mp4
+```
+
+### Visualize Predictions
+
+```bash
+python scripts/visualize_annotations.py \
+  --video data/train/samples/Backpack_0/drone_video.mp4 \
+  --predictions outputs/predictions/predictions.json \
+  --video_id Backpack_0 \
+  --output outputs/debug_viz/Backpack_0_pred.mp4
+```
+
+### Side-by-Side Comparison
+
+```bash
+python scripts/visualize_annotations.py \
+  --video data/train/samples/Backpack_0/drone_video.mp4 \
+  --annotations data/train/annotations/annotations.json \
+  --predictions outputs/predictions/predictions.json \
+  --video_id Backpack_0 \
+  --output outputs/debug_viz/Backpack_0_comparison.mp4 \
+  --compare
+```
+
+## Dataset Analysis
+
+### Print Statistics
+
+```bash
+python scripts/prepare_dataset.py \
+  --annotations data/train/annotations/annotations.json \
+  --stats
+```
+
+### Detailed Analysis
+
+```bash
+python scripts/prepare_dataset.py \
+  --annotations data/train/annotations/annotations.json \
+  --analyze
+```
+
+### Create Custom Splits
+
+```bash
+python scripts/prepare_dataset.py \
+  --annotations data/train/annotations/annotations.json \
+  --create_splits \
+  --train_ratio 0.8 \
+  --output_dir data/splits
+```
+
 ## Next Steps
 
-1. **Phase 3**: Implement evaluation metrics (ST-IoU)
-2. **Optimization**: Tune hyperparameters on validation set
-3. **Visualization**: Add tools to visualize predictions
-4. **Jetson Deployment**: Optimize for on-device inference
+1. **Optimization**: Tune hyperparameters on validation set
+2. **Jetson Deployment**: Optimize for on-device inference
+3. **Advanced Features**: Add temporal smoothing, multi-scale detection
