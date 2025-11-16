@@ -73,19 +73,44 @@ def run_inference(cfg, args):
             with torch.no_grad():
                 cls_logits, bbox_pred = model(frame_tensor)
 
-            # TODO: Decode bbox and confidence from model outputs
-            # For now, this is a placeholder
-            # Need to implement proper decoding based on head architecture
+            # Decode bbox and confidence from model outputs
+            # cls_logits: (1, 1, H, W) - objectness heatmap
+            # bbox_pred: (1, 4, H, W) - bbox predictions at each location
 
-            # Placeholder detection (will be replaced when head.py is implemented)
-            # detections.append({
-            #     "frame": frame_idx,
-            #     "x1": ...,
-            #     "y1": ...,
-            #     "x2": ...,
-            #     "y2": ...,
-            #     "score": ...
-            # })
+            # Apply sigmoid to get confidence scores
+            cls_scores = torch.sigmoid(cls_logits[0, 0])  # (H, W)
+
+            # Find location with maximum confidence
+            max_score = cls_scores.max().item()
+            max_loc = (cls_scores == max_score).nonzero(as_tuple=False)[0]  # (y, x)
+            max_y, max_x = max_loc[0].item(), max_loc[1].item()
+
+            # Get bbox prediction at max location
+            bbox_at_max = bbox_pred[0, :, max_y, max_x]  # (4,)
+
+            # Scale bbox to image coordinates
+            # bbox_at_max is in normalized form, scale to target_size
+            x1 = bbox_at_max[0].item() * target_size[0]
+            y1 = bbox_at_max[1].item() * target_size[1]
+            x2 = bbox_at_max[2].item() * target_size[0]
+            y2 = bbox_at_max[3].item() * target_size[1]
+
+            # Clamp to image bounds
+            x1 = max(0, min(x1, target_size[0]))
+            y1 = max(0, min(y1, target_size[1]))
+            x2 = max(0, min(x2, target_size[0]))
+            y2 = max(0, min(y2, target_size[1]))
+
+            # Add detection if score is reasonable
+            if max_score > 0.01:  # Very low threshold to catch all potential detections
+                detections.append({
+                    "frame": frame_idx,
+                    "x1": int(x1),
+                    "y1": int(y1),
+                    "x2": int(x2),
+                    "y2": int(y2),
+                    "score": max_score
+                })
 
             frame_idx += 1
 
