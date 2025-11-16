@@ -20,23 +20,48 @@ def build_parser():
 
     # Eval
     p_eval = subparsers.add_parser("eval", help="Evaluate predictions vs GT")
-    p_eval.add_argument("--predictions", required=True)
-    p_eval.add_argument("--annotations", required=True)
+    p_eval.add_argument("--predictions", required=True, help="Path to predictions JSON")
+    p_eval.add_argument("--annotations", required=True, help="Path to annotations JSON")
+    p_eval.add_argument("--output", help="Optional path to save results JSON")
+    p_eval.add_argument("--verbose", action="store_true", help="Print detailed results")
 
     return parser
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    cfg = load_config(args.config)
 
     if args.command == "train":
+        cfg = load_config(args.config)
         train_module.run_training(cfg)
     elif args.command == "infer":
+        cfg = load_config(args.config)
         infer_module.run_inference(cfg, args)
     elif args.command == "eval":
-        from .utils.metrics import evaluate_predictions
-        evaluate_predictions(args.predictions, args.annotations)
+        from .utils.metrics import evaluate_predictions, print_evaluation_results
+        import json
+        from pathlib import Path
+
+        results = evaluate_predictions(args.predictions, args.annotations)
+        print_evaluation_results(results)
+
+        if args.verbose:
+            print("\nDetailed Per-Interval Matches:")
+            print("="*80)
+            for video_id, scores in sorted(results['video_scores'].items()):
+                print(f"\n{video_id}:")
+                for gt_idx, pred_idx, iou in scores['matched_ious']:
+                    if pred_idx >= 0:
+                        print(f"  GT interval {gt_idx} -> Pred interval {pred_idx}: ST-IoU = {iou:.4f}")
+                    else:
+                        print(f"  GT interval {gt_idx} -> No match (ST-IoU = {iou:.4f})")
+
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"\nResults saved to: {output_path}")
     else:
         parser.print_help()
 
