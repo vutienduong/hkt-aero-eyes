@@ -124,8 +124,8 @@ def run_training(cfg):
     # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=cfg["train"]["lr"],
-        weight_decay=cfg["train"]["weight_decay"],
+        lr=float(cfg["train"]["lr"]),
+        weight_decay=float(cfg["train"]["weight_decay"]),
     )
 
     # Learning rate scheduler
