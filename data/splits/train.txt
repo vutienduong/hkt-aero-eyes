@@ -1,0 +1,11 @@
+Backpack_0
+Backpack_1
+Jacket_0
+Laptop_0
+Laptop_1
+Lifering_0
+MobilePhone_0
+MobilePhone_1
+Person1_0
+WaterBottle_0
+WaterBottle_1

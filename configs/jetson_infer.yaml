@@ -1,0 +1,19 @@
+experiment_name: "jetson_inference"
+
+data:
+  root: "data/public_test"
+  samples_dir: "samples"
+  frame_size: [640, 360]
+  template_images: ["img_1.jpg", "img_2.jpg", "img_3.jpg"]
+
+model:
+  backbone: "resnet18"
+  backbone_pretrained: true
+  feature_dim: 256
+  head_type: "siam_rpn"
+  template_size: [128, 128]
+
+infer:
+  confidence_threshold: 0.4
+  max_gap: 3
+  min_interval_len: 5
