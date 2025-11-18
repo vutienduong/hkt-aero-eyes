@@ -33,8 +33,30 @@ class AeroEyesDataset(Dataset):
         with open(split_file, "r") as f:
             self.video_ids = [line.strip() for line in f if line.strip()]
 
+        # Cache video frame counts for validation
+        print("Validating video frame counts...")
+        self.video_frame_counts = self._get_video_frame_counts()
+
         # Build training samples from annotations
         self.samples = self._build_samples()
+        print(f"Dataset initialized with {len(self.samples)} valid samples")
+
+    def _get_video_frame_counts(self):
+        """Get frame count for each video to validate annotations."""
+        frame_counts = {}
+        for video_id in self.video_ids:
+            video_path = self.root / "samples" / video_id / "drone_video.mp4"
+            if not video_path.exists():
+                print(f"Warning: Video not found: {video_id}")
+                frame_counts[video_id] = 0
+                continue
+
+            cap = cv2.VideoCapture(str(video_path))
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            frame_counts[video_id] = frame_count
+
+        return frame_counts
 
     def _build_samples(self):
         """
@@ -42,12 +64,18 @@ class AeroEyesDataset(Dataset):
         Each sample: (video_id, template_frame_idx, search_frame_idx, template_bbox, search_bbox)
         """
         samples = []
+        skipped_count = 0
 
         for video_id in self.video_ids:
             if video_id not in self.annotations_map:
                 continue
 
             video_ann = self.annotations_map[video_id]
+            max_frame = self.video_frame_counts.get(video_id, 0)
+
+            if max_frame == 0:
+                print(f"Skipping {video_id}: no valid frames")
+                continue
 
             # Each video has multiple annotation intervals
             for interval in video_ann["annotations"]:
@@ -64,18 +92,74 @@ class AeroEyesDataset(Dataset):
                 for search_idx in range(1, len(bboxes)):
                     search_bbox = bboxes[search_idx]
 
+                    # Validate frame numbers
+                    template_frame = template_bbox["frame"]
+                    search_frame = search_bbox["frame"]
+
+                    if template_frame >= max_frame or search_frame >= max_frame:
+                        skipped_count += 1
+                        continue
+
                     samples.append({
                         "video_id": video_id,
-                        "template_frame": template_bbox["frame"],
-                        "search_frame": search_bbox["frame"],
+                        "template_frame": template_frame,
+                        "search_frame": search_frame,
                         "template_bbox": template_bbox,
                         "search_bbox": search_bbox,
                     })
+
+        if skipped_count > 0:
+            print(f"Skipped {skipped_count} samples due to invalid frame numbers")
 
         return samples
 
     def __len__(self):
         return len(self.samples)
+
+    def _read_frame(self, cap, frame_idx, video_id, frame_type="frame"):
+        """
+        Safely read a frame from video with fallback strategies.
+
+        Args:
+            cap: cv2.VideoCapture object
+            frame_idx: Frame index to read
+            video_id: Video ID for error messages
+            frame_type: "template" or "search" for error messages
+
+        Returns:
+            frame: BGR frame as numpy array
+
+        Raises:
+            RuntimeError: If frame cannot be read after all attempts
+        """
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Check if frame is within bounds (should be caught during sample building)
+        if frame_idx >= total_frames:
+            raise RuntimeError(
+                f"Frame {frame_idx} out of bounds for {video_id} "
+                f"(total: {total_frames}). This should have been filtered during dataset construction."
+            )
+
+        # Try seeking method first (faster)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+
+        if ret and frame is not None:
+            return frame
+
+        # Fallback: sequential read (slower but more reliable)
+        print(f"Warning: Seeking failed for frame {frame_idx} in {video_id}, trying sequential read...")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        for i in range(frame_idx + 1):
+            ret, frame = cap.read()
+            if not ret:
+                raise RuntimeError(
+                    f"Failed to read {frame_type} frame {frame_idx} from {video_id} "
+                    f"(stopped at frame {i}/{total_frames})"
+                )
+
+        return frame
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -85,25 +169,28 @@ class AeroEyesDataset(Dataset):
         video_path = self.root / "samples" / video_id / "drone_video.mp4"
         cap = cv2.VideoCapture(str(video_path))
 
-        # Read template frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, sample["template_frame"])
-        ret, template_frame = cap.read()
-        if not ret:
-            raise RuntimeError(f"Failed to read template frame {sample['template_frame']} from {video_id}")
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video {video_id}")
 
-        # Crop template bbox
-        tb = sample["template_bbox"]
-        template_img = template_frame[tb["y1"]:tb["y2"], tb["x1"]:tb["x2"]]
-        template_img = cv2.cvtColor(template_img, cv2.COLOR_BGR2RGB)
+        try:
+            # Read template frame
+            template_frame = self._read_frame(
+                cap, sample["template_frame"], video_id, "template"
+            )
 
-        # Read search frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, sample["search_frame"])
-        ret, search_frame = cap.read()
-        if not ret:
-            raise RuntimeError(f"Failed to read search frame {sample['search_frame']} from {video_id}")
+            # Crop template bbox
+            tb = sample["template_bbox"]
+            template_img = template_frame[tb["y1"]:tb["y2"], tb["x1"]:tb["x2"]]
+            template_img = cv2.cvtColor(template_img, cv2.COLOR_BGR2RGB)
 
-        search_img = cv2.cvtColor(search_frame, cv2.COLOR_BGR2RGB)
-        cap.release()
+            # Read search frame
+            search_frame = self._read_frame(
+                cap, sample["search_frame"], video_id, "search"
+            )
+
+            search_img = cv2.cvtColor(search_frame, cv2.COLOR_BGR2RGB)
+        finally:
+            cap.release()
 
         # Target bbox in search frame
         sb = sample["search_bbox"]
