@@ -20,13 +20,15 @@ class SiamTracker(nn.Module):
 
     def forward(self, search_img, template_img=None):
         """
-        During training: pass both template and search.
+        During training/validation: pass both template and search.
         During inference: pre-set template via set_template(), pass search only.
         """
-        if self.training:
+        if template_img is not None:
+            # Training/validation mode: compute fresh template features
             template_feat = self.backbone(template_img)
         else:
-            assert self.template_feat is not None, "Call set_template() first"
+            # Inference mode: use cached template features
+            assert self.template_feat is not None, "Call set_template() first or pass template_img"
             template_feat = self.template_feat
 
         search_feat = self.backbone(search_img)
