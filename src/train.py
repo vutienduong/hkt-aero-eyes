@@ -80,8 +80,8 @@ def run_training(cfg):
         logger.info("cuDNN benchmarking enabled for GPU optimization")
 
     # Setup Automatic Mixed Precision (AMP) for faster training
-    from torch.cuda.amp import autocast, GradScaler
-    scaler = GradScaler()
+    from torch.amp import autocast, GradScaler
+    scaler = GradScaler('cuda')
 
     # Create transforms
     train_transform = AeroEyesTransform(
@@ -169,7 +169,7 @@ def run_training(cfg):
             target_bbox = target_bbox.to(device, non_blocking=True)  # (B, 4)
 
             # Wrap forward pass in autocast for mixed precision
-            with autocast():
+            with autocast('cuda'):
                 # Forward pass
                 cls_logits, bbox_pred = model(search, template_img=template)
 
@@ -284,7 +284,7 @@ def run_training(cfg):
 
 def validate(model, val_loader, device, cls_criterion, cfg):
     """Run validation."""
-    from torch.cuda.amp import autocast
+    from torch.amp import autocast
 
     model.eval()
     val_losses = []
@@ -297,7 +297,7 @@ def validate(model, val_loader, device, cls_criterion, cfg):
             target_bbox = target_bbox.to(device, non_blocking=True)
 
             # Use autocast for mixed precision inference
-            with autocast():
+            with autocast('cuda'):
                 cls_logits, bbox_pred = model(search, template_img=template)
 
                 # Same loss computation as training
