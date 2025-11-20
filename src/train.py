@@ -153,6 +153,12 @@ def run_training(cfg):
 
     best_val_loss = float('inf')
 
+    # Gradient accumulation settings
+    gradient_accumulation_steps = cfg["train"].get("gradient_accumulation_steps", 1)
+    if gradient_accumulation_steps > 1:
+        logger.info(f"Using gradient accumulation with {gradient_accumulation_steps} steps")
+        logger.info(f"Effective batch size: {cfg['data']['batch_size'] * gradient_accumulation_steps}")
+
     # Training loop
     for epoch in range(cfg["train"]["epochs"]):
         model.train()
@@ -220,22 +226,26 @@ def run_training(cfg):
                 # Compute GIoU loss
                 bbox_loss = giou_loss(bbox_preds_scaled, target_bbox)
 
-                # Total loss
-                loss = cls_loss + bbox_loss
+                # Total loss (scale by accumulation steps for proper averaging)
+                loss = (cls_loss + bbox_loss) / gradient_accumulation_steps
 
             # Backward with gradient scaling for mixed precision
-            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
 
-            # Logging
-            train_losses.append(loss.item())
+            # Only step optimizer after accumulating gradients
+            if (step + 1) % gradient_accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+            # Logging (multiply back to get actual loss for display)
+            actual_loss = loss.item() * gradient_accumulation_steps
+            train_losses.append(actual_loss)
             train_cls_losses.append(cls_loss.item())
             train_bbox_losses.append(bbox_loss.item())
 
             pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
+                'loss': f'{actual_loss:.4f}',
                 'cls': f'{cls_loss.item():.4f}',
                 'bbox': f'{bbox_loss.item():.4f}'
             })
@@ -244,7 +254,7 @@ def run_training(cfg):
             if (step + 1) % cfg["train"]["log_interval"] == 0:
                 logger.info(
                     f"Epoch {epoch+1}, Step {step+1}: "
-                    f"loss={loss.item():.4f}, cls={cls_loss.item():.4f}, bbox={bbox_loss.item():.4f}"
+                    f"loss={actual_loss:.4f}, cls={cls_loss.item():.4f}, bbox={bbox_loss.item():.4f}"
                 )
 
         avg_train_loss = sum(train_losses) / len(train_losses)
