@@ -274,22 +274,36 @@ def run_training(cfg):
                 # Unscale gradients for clipping
                 scaler.unscale_(optimizer)
 
-                # Gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                # Check for NaN/inf in gradients
+                # Check gradient norms before clipping
+                total_norm = 0
+                max_grad = 0
                 has_nan_inf = False
                 for param in model.parameters():
                     if param.grad is not None:
+                        # Check for NaN/inf
                         if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                             has_nan_inf = True
                             break
+                        # Track gradient statistics
+                        param_norm = param.grad.data.norm(2).item()
+                        total_norm += param_norm ** 2
+                        max_grad = max(max_grad, param.grad.abs().max().item())
+
+                total_norm = total_norm ** 0.5
 
                 if has_nan_inf:
-                    logger.warning(f"NaN/inf detected in gradients at step {step}, skipping optimizer step")
+                    logger.warning(f"NaN/inf detected in gradients at step {step}")
+                    logger.warning(f"  Loss values: cls={cls_loss.item():.4f}, bbox={bbox_loss.item():.4f}")
                     optimizer.zero_grad(set_to_none=True)
                     scaler.update()
                 else:
+                    # Log gradient stats periodically
+                    if step % 10 == 0:
+                        logger.info(f"Gradient norm: {total_norm:.4f}, max grad: {max_grad:.4f}")
+
+                    # Gradient clipping to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
