@@ -7,7 +7,7 @@ data:
   frame_size: [640, 360]
   train_split: "data/splits/train.txt"
   val_split: "data/splits/val.txt"
-  batch_size: 64  # Reduced for stability - increase to 96-128 once training is stable
+  batch_size: 128  # Optimized for L4 GPU - better utilization (~60-70% VRAM)
   num_workers: 2  # Colab recommends max 2 workers for stability
   template_images: ["img_1.jpg", "img_2.jpg", "img_3.jpg"]
 
@@ -21,10 +21,11 @@ model:
 train:
   epochs: 5  # Reduced for faster iteration; increase for final training
   optimizer: "adamw"
-  lr: 0.00001  # Reduced from 0.0001 to prevent gradient explosion
+  lr: 0.00001  # Target LR after warmup
+  lr_warmup_steps: 500  # Warmup from 1e-6 to 1e-5 over 500 steps
   weight_decay: 0.0001
   log_interval: 50
-  val_interval: 1
+  val_interval: 2  # Validate every 2 epochs to save time
   checkpoint_dir: "checkpoints"
   gradient_accumulation_steps: 1  # Increase to 2-4 for larger effective batch size
 

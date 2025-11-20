@@ -156,19 +156,35 @@ def run_training(cfg):
         feature_dim=cfg["model"]["feature_dim"],
     ).to(device)
 
-    # Optimizer
+    # Optimizer (start with low LR for warmup)
+    warmup_steps = cfg["train"].get("lr_warmup_steps", 0)
+    target_lr = float(cfg["train"]["lr"])
+    initial_lr = target_lr * 0.1 if warmup_steps > 0 else target_lr
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(cfg["train"]["lr"]),
+        lr=initial_lr,
         weight_decay=float(cfg["train"]["weight_decay"]),
     )
 
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer,
-        step_size=cfg["train"].get("lr_step", 10),
-        gamma=cfg["train"].get("lr_gamma", 0.1),
-    )
+    # Learning rate scheduler with warmup
+    if warmup_steps > 0:
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                # Linear warmup from 0.1x to 1.0x
+                return 0.1 + (0.9 * current_step / warmup_steps)
+            else:
+                # Constant LR after warmup
+                return 1.0
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        logger.info(f"Using warmup scheduler: {warmup_steps} steps from {initial_lr:.2e} to {target_lr:.2e}")
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=cfg["train"].get("lr_step", 10),
+            gamma=cfg["train"].get("lr_gamma", 0.1),
+        )
 
     # Loss functions
     cls_criterion = nn.BCEWithLogitsLoss()
@@ -308,6 +324,10 @@ def run_training(cfg):
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
 
+                    # Step scheduler after optimizer update (for warmup)
+                    if warmup_steps > 0:
+                        scheduler.step()
+
             # Logging (multiply back to get actual loss for display)
             actual_loss = loss.item() * gradient_accumulation_steps
             train_losses.append(actual_loss)
@@ -357,7 +377,9 @@ def run_training(cfg):
             'train_loss': avg_train_loss,
         }, checkpoint_path)
 
-        scheduler.step()
+        # Step scheduler only if not using warmup (warmup steps per batch)
+        if warmup_steps == 0:
+            scheduler.step()
 
     logger.info("Training complete!")
 
