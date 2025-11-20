@@ -74,6 +74,15 @@ def run_training(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
+    # Enable cuDNN benchmarking for faster training on A100
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        logger.info("cuDNN benchmarking enabled for GPU optimization")
+
+    # Setup Automatic Mixed Precision (AMP) for faster training
+    from torch.cuda.amp import autocast, GradScaler
+    scaler = GradScaler()
+
     # Create transforms
     train_transform = AeroEyesTransform(
         template_size=tuple(cfg["model"]["template_size"]),
@@ -154,65 +163,71 @@ def run_training(cfg):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['train']['epochs']}")
 
         for step, (template, search, target_bbox) in enumerate(pbar):
-            template = template.to(device)
-            search = search.to(device)
-            target_bbox = target_bbox.to(device)  # (B, 4)
+            # Use non_blocking for async GPU transfers
+            template = template.to(device, non_blocking=True)
+            search = search.to(device, non_blocking=True)
+            target_bbox = target_bbox.to(device, non_blocking=True)  # (B, 4)
 
-            # Forward pass
-            cls_logits, bbox_pred = model(search, template_img=template)
+            # Wrap forward pass in autocast for mixed precision
+            with autocast():
+                # Forward pass
+                cls_logits, bbox_pred = model(search, template_img=template)
 
-            # Classification loss
-            # For simplicity, we'll use a heatmap approach
-            # Create a target heatmap based on bbox location
-            B, _, H, W = cls_logits.shape
+                # Classification loss
+                # For simplicity, we'll use a heatmap approach
+                # Create a target heatmap based on bbox location
+                B, _, H, W = cls_logits.shape
 
-            # Simple approach: center of bbox is positive, rest is negative
-            target_cls = torch.zeros_like(cls_logits)
-            for i in range(B):
-                x1, y1, x2, y2 = target_bbox[i]
-                cx = ((x1 + x2) / 2 / cfg["data"]["frame_size"][0] * W).long().clamp(0, W-1)
-                cy = ((y1 + y2) / 2 / cfg["data"]["frame_size"][1] * H).long().clamp(0, H-1)
-
-                # Create Gaussian around center
+                # Precompute meshgrid once per batch (not per sample)
                 y_grid, x_grid = torch.meshgrid(
                     torch.arange(H, device=device),
                     torch.arange(W, device=device),
                     indexing='ij'
                 )
+
+                # Simple approach: center of bbox is positive, rest is negative
+                target_cls = torch.zeros_like(cls_logits)
                 sigma = 2.0
-                gaussian = torch.exp(-((x_grid - cx)**2 + (y_grid - cy)**2) / (2 * sigma**2))
-                target_cls[i, 0] = gaussian
+                for i in range(B):
+                    x1, y1, x2, y2 = target_bbox[i]
+                    cx = ((x1 + x2) / 2 / cfg["data"]["frame_size"][0] * W).long().clamp(0, W-1)
+                    cy = ((y1 + y2) / 2 / cfg["data"]["frame_size"][1] * H).long().clamp(0, H-1)
 
-            cls_loss = cls_criterion(cls_logits, target_cls)
+                    # Create Gaussian around center (reusing precomputed grid)
+                    gaussian = torch.exp(-((x_grid - cx)**2 + (y_grid - cy)**2) / (2 * sigma**2))
+                    target_cls[i, 0] = gaussian
 
-            # Bbox regression loss
-            # Get bbox prediction at center location
-            bbox_preds_at_center = []
-            for i in range(B):
-                x1, y1, x2, y2 = target_bbox[i]
-                cx = ((x1 + x2) / 2 / cfg["data"]["frame_size"][0] * W).long().clamp(0, W-1)
-                cy = ((y1 + y2) / 2 / cfg["data"]["frame_size"][1] * H).long().clamp(0, H-1)
-                bbox_preds_at_center.append(bbox_pred[i, :, cy, cx])
+                cls_loss = cls_criterion(cls_logits, target_cls)
 
-            bbox_preds_at_center = torch.stack(bbox_preds_at_center)  # (B, 4)
+                # Bbox regression loss
+                # Get bbox prediction at center location
+                bbox_preds_at_center = []
+                for i in range(B):
+                    x1, y1, x2, y2 = target_bbox[i]
+                    cx = ((x1 + x2) / 2 / cfg["data"]["frame_size"][0] * W).long().clamp(0, W-1)
+                    cy = ((y1 + y2) / 2 / cfg["data"]["frame_size"][1] * H).long().clamp(0, H-1)
+                    bbox_preds_at_center.append(bbox_pred[i, :, cy, cx])
 
-            # Scale predictions to image size
-            bbox_preds_scaled = bbox_preds_at_center * torch.tensor(
-                [cfg["data"]["frame_size"][0], cfg["data"]["frame_size"][1],
-                 cfg["data"]["frame_size"][0], cfg["data"]["frame_size"][1]],
-                device=device
-            )
+                bbox_preds_at_center = torch.stack(bbox_preds_at_center)  # (B, 4)
 
-            # Compute GIoU loss
-            bbox_loss = giou_loss(bbox_preds_scaled, target_bbox)
+                # Scale predictions to image size
+                bbox_preds_scaled = bbox_preds_at_center * torch.tensor(
+                    [cfg["data"]["frame_size"][0], cfg["data"]["frame_size"][1],
+                     cfg["data"]["frame_size"][0], cfg["data"]["frame_size"][1]],
+                    device=device
+                )
 
-            # Total loss
-            loss = cls_loss + bbox_loss
+                # Compute GIoU loss
+                bbox_loss = giou_loss(bbox_preds_scaled, target_bbox)
 
-            # Backward
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                # Total loss
+                loss = cls_loss + bbox_loss
+
+            # Backward with gradient scaling for mixed precision
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             # Logging
             train_losses.append(loss.item())
@@ -269,55 +284,63 @@ def run_training(cfg):
 
 def validate(model, val_loader, device, cls_criterion, cfg):
     """Run validation."""
+    from torch.cuda.amp import autocast
+
     model.eval()
     val_losses = []
 
     with torch.no_grad():
         for template, search, target_bbox in tqdm(val_loader, desc="Validation"):
-            template = template.to(device)
-            search = search.to(device)
-            target_bbox = target_bbox.to(device)
+            # Use non_blocking for async GPU transfers
+            template = template.to(device, non_blocking=True)
+            search = search.to(device, non_blocking=True)
+            target_bbox = target_bbox.to(device, non_blocking=True)
 
-            cls_logits, bbox_pred = model(search, template_img=template)
+            # Use autocast for mixed precision inference
+            with autocast():
+                cls_logits, bbox_pred = model(search, template_img=template)
 
-            # Same loss computation as training
-            B, _, H, W = cls_logits.shape
-            target_cls = torch.zeros_like(cls_logits)
+                # Same loss computation as training
+                B, _, H, W = cls_logits.shape
 
-            for i in range(B):
-                x1, y1, x2, y2 = target_bbox[i]
-                cx = ((x1 + x2) / 2 / cfg["data"]["frame_size"][0] * W).long().clamp(0, W-1)
-                cy = ((y1 + y2) / 2 / cfg["data"]["frame_size"][1] * H).long().clamp(0, H-1)
-
+                # Precompute meshgrid once per batch (not per sample)
                 y_grid, x_grid = torch.meshgrid(
                     torch.arange(H, device=device),
                     torch.arange(W, device=device),
                     indexing='ij'
                 )
+
+                target_cls = torch.zeros_like(cls_logits)
                 sigma = 2.0
-                gaussian = torch.exp(-((x_grid - cx)**2 + (y_grid - cy)**2) / (2 * sigma**2))
-                target_cls[i, 0] = gaussian
+                for i in range(B):
+                    x1, y1, x2, y2 = target_bbox[i]
+                    cx = ((x1 + x2) / 2 / cfg["data"]["frame_size"][0] * W).long().clamp(0, W-1)
+                    cy = ((y1 + y2) / 2 / cfg["data"]["frame_size"][1] * H).long().clamp(0, H-1)
 
-            cls_loss = cls_criterion(cls_logits, target_cls)
+                    # Create Gaussian around center (reusing precomputed grid)
+                    gaussian = torch.exp(-((x_grid - cx)**2 + (y_grid - cy)**2) / (2 * sigma**2))
+                    target_cls[i, 0] = gaussian
 
-            bbox_preds_at_center = []
-            for i in range(B):
-                x1, y1, x2, y2 = target_bbox[i]
-                cx = ((x1 + x2) / 2 / cfg["data"]["frame_size"][0] * W).long().clamp(0, W-1)
-                cy = ((y1 + y2) / 2 / cfg["data"]["frame_size"][1] * H).long().clamp(0, H-1)
-                bbox_preds_at_center.append(bbox_pred[i, :, cy, cx])
+                cls_loss = cls_criterion(cls_logits, target_cls)
 
-            bbox_preds_at_center = torch.stack(bbox_preds_at_center)
-            bbox_preds_scaled = bbox_preds_at_center * torch.tensor(
-                [cfg["data"]["frame_size"][0], cfg["data"]["frame_size"][1],
-                 cfg["data"]["frame_size"][0], cfg["data"]["frame_size"][1]],
-                device=device
-            )
+                bbox_preds_at_center = []
+                for i in range(B):
+                    x1, y1, x2, y2 = target_bbox[i]
+                    cx = ((x1 + x2) / 2 / cfg["data"]["frame_size"][0] * W).long().clamp(0, W-1)
+                    cy = ((y1 + y2) / 2 / cfg["data"]["frame_size"][1] * H).long().clamp(0, H-1)
+                    bbox_preds_at_center.append(bbox_pred[i, :, cy, cx])
 
-            bbox_loss = giou_loss(bbox_preds_scaled, target_bbox)
-            loss = cls_loss + bbox_loss
+                bbox_preds_at_center = torch.stack(bbox_preds_at_center)
+                bbox_preds_scaled = bbox_preds_at_center * torch.tensor(
+                    [cfg["data"]["frame_size"][0], cfg["data"]["frame_size"][1],
+                     cfg["data"]["frame_size"][0], cfg["data"]["frame_size"][1]],
+                    device=device
+                )
 
-            val_losses.append(loss.item())
+                bbox_loss = giou_loss(bbox_preds_scaled, target_bbox)
+                loss = cls_loss + bbox_loss
+
+                val_losses.append(loss.item())
 
     model.train()
     return sum(val_losses) / len(val_losses)

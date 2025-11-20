@@ -7,8 +7,8 @@ data:
   frame_size: [640, 360]
   train_split: "data/splits/train.txt"
   val_split: "data/splits/val.txt"
-  batch_size: 32
-  num_workers: 4
+  batch_size: 32  # Can increase to 48-64 for A100 GPU if memory allows
+  num_workers: 2  # Colab recommends max 2 workers for stability
   template_images: ["img_1.jpg", "img_2.jpg", "img_3.jpg"]
 
 model:
@@ -19,7 +19,7 @@ model:
   template_size: [128, 128]
 
 train:
-  epochs: 20
+  epochs: 5  # Reduced for faster iteration; increase for final training
   optimizer: "adamw"
   lr: 0.0001
   weight_decay: 0.0001
