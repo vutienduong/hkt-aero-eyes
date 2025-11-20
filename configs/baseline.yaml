@@ -7,7 +7,7 @@ data:
   frame_size: [640, 360]
   train_split: "data/splits/train.txt"
   val_split: "data/splits/val.txt"
-  batch_size: 128  # Optimized for L4 GPU - better utilization (~60-70% VRAM)
+  batch_size: 512  # Optimized for A100 40GB - uses ~32-35GB (80-90% VRAM)
   num_workers: 2  # Colab recommends max 2 workers for stability
   template_images: ["img_1.jpg", "img_2.jpg", "img_3.jpg"]
 
@@ -28,7 +28,7 @@ train:
   log_interval: 50
   val_interval: 2  # Validate every 2 epochs to save time
   checkpoint_dir: "checkpoints"
-  gradient_accumulation_steps: 2  # Effective batch = 128×2 = 256
+  gradient_accumulation_steps: 1  # No accumulation needed with large batch_size=512
 
 infer:
   confidence_threshold: 0.4
