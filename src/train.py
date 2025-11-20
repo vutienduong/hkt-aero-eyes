@@ -35,15 +35,22 @@ def compute_iou(boxes1, boxes2):
     return iou
 
 
-def giou_loss(pred_boxes, target_boxes):
+def giou_loss(pred_boxes, target_boxes, eps=1e-7):
     """
-    Generalized IoU loss.
+    Generalized IoU loss with improved numerical stability.
     Args:
         pred_boxes: (N, 4) [x1, y1, x2, y2]
         target_boxes: (N, 4) [x1, y1, x2, y2]
     Returns:
         loss: scalar
     """
+    # Clamp predicted boxes to prevent invalid coordinates
+    pred_boxes = pred_boxes.clamp(min=0)
+
+    # Ensure x2 > x1 and y2 > y1
+    pred_boxes[:, 2] = torch.max(pred_boxes[:, 2], pred_boxes[:, 0] + eps)
+    pred_boxes[:, 3] = torch.max(pred_boxes[:, 3], pred_boxes[:, 1] + eps)
+
     # IoU
     iou = compute_iou(pred_boxes, target_boxes)
 
@@ -53,18 +60,26 @@ def giou_loss(pred_boxes, target_boxes):
     x2_max = torch.max(pred_boxes[:, 2], target_boxes[:, 2])
     y2_max = torch.max(pred_boxes[:, 3], target_boxes[:, 3])
 
-    enclosing_area = (x2_max - x1_min) * (y2_max - y1_min)
+    enclosing_area = torch.clamp((x2_max - x1_min) * (y2_max - y1_min), min=eps)
 
-    # Union area
-    area1 = (pred_boxes[:, 2] - pred_boxes[:, 0]) * (pred_boxes[:, 3] - pred_boxes[:, 1])
-    area2 = (target_boxes[:, 2] - target_boxes[:, 0]) * (target_boxes[:, 3] - target_boxes[:, 1])
-    union = area1 + area2 - iou * (area1 + area2 - area1 * area2)
+    # Union area (corrected calculation)
+    area1 = torch.clamp((pred_boxes[:, 2] - pred_boxes[:, 0]) * (pred_boxes[:, 3] - pred_boxes[:, 1]), min=eps)
+    area2 = torch.clamp((target_boxes[:, 2] - target_boxes[:, 0]) * (target_boxes[:, 3] - target_boxes[:, 1]), min=eps)
 
-    # GIoU
-    giou = iou - (enclosing_area - union) / (enclosing_area + 1e-6)
+    # Compute intersection for union
+    x1_max = torch.max(pred_boxes[:, 0], target_boxes[:, 0])
+    y1_max = torch.max(pred_boxes[:, 1], target_boxes[:, 1])
+    x2_min = torch.min(pred_boxes[:, 2], target_boxes[:, 2])
+    y2_min = torch.min(pred_boxes[:, 3], target_boxes[:, 3])
+    intersection = torch.clamp(x2_min - x1_max, min=0) * torch.clamp(y2_min - y1_max, min=0)
 
-    # Loss is 1 - GIoU
-    loss = 1 - giou
+    union = area1 + area2 - intersection
+
+    # GIoU with numerical stability
+    giou = iou - torch.clamp((enclosing_area - union) / enclosing_area, min=-1.0, max=1.0)
+
+    # Loss is 1 - GIoU, clamped to [0, 2]
+    loss = torch.clamp(1 - giou, min=0.0, max=2.0)
     return loss.mean()
 
 
@@ -105,6 +120,8 @@ def run_training(cfg):
         shuffle=True,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=True,
+        persistent_workers=True if cfg["data"]["num_workers"] > 0 else False,
+        prefetch_factor=4 if cfg["data"]["num_workers"] > 0 else None,
     )
 
     # Validation dataset
@@ -120,6 +137,8 @@ def run_training(cfg):
         shuffle=False,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=True,
+        persistent_workers=True if cfg["data"]["num_workers"] > 0 else False,
+        prefetch_factor=4 if cfg["data"]["num_workers"] > 0 else None,
     )
 
     logger.info(f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}")
@@ -226,6 +245,17 @@ def run_training(cfg):
                 # Compute GIoU loss
                 bbox_loss = giou_loss(bbox_preds_scaled, target_bbox)
 
+                # Check for NaN/inf in losses
+                if torch.isnan(cls_loss) or torch.isinf(cls_loss):
+                    logger.warning(f"NaN/inf in cls_loss at step {step}")
+                    cls_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+                if torch.isnan(bbox_loss) or torch.isinf(bbox_loss):
+                    logger.warning(f"NaN/inf in bbox_loss at step {step}")
+                    logger.warning(f"  pred_boxes range: [{bbox_preds_scaled.min():.2f}, {bbox_preds_scaled.max():.2f}]")
+                    logger.warning(f"  target_boxes range: [{target_bbox.min():.2f}, {target_bbox.max():.2f}]")
+                    bbox_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
                 # Total loss (scale by accumulation steps for proper averaging)
                 loss = (cls_loss + bbox_loss) / gradient_accumulation_steps
 
@@ -234,9 +264,28 @@ def run_training(cfg):
 
             # Only step optimizer after accumulating gradients
             if (step + 1) % gradient_accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+                # Unscale gradients for clipping
+                scaler.unscale_(optimizer)
+
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # Check for NaN/inf in gradients
+                has_nan_inf = False
+                for param in model.parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            has_nan_inf = True
+                            break
+
+                if has_nan_inf:
+                    logger.warning(f"NaN/inf detected in gradients at step {step}, skipping optimizer step")
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
 
             # Logging (multiply back to get actual loss for display)
             actual_loss = loss.item() * gradient_accumulation_steps
