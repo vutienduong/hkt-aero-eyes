@@ -44,12 +44,19 @@ def giou_loss(pred_boxes, target_boxes, eps=1e-7):
     Returns:
         loss: scalar
     """
+    # Clone to avoid in-place operations on tensors that need gradients
+    pred_boxes = pred_boxes.clone()
+
     # Clamp predicted boxes to prevent invalid coordinates
     pred_boxes = pred_boxes.clamp(min=0)
 
-    # Ensure x2 > x1 and y2 > y1
-    pred_boxes[:, 2] = torch.max(pred_boxes[:, 2], pred_boxes[:, 0] + eps)
-    pred_boxes[:, 3] = torch.max(pred_boxes[:, 3], pred_boxes[:, 1] + eps)
+    # Ensure x2 > x1 and y2 > y1 (avoiding in-place ops)
+    pred_boxes = torch.stack([
+        pred_boxes[:, 0],
+        pred_boxes[:, 1],
+        torch.max(pred_boxes[:, 2], pred_boxes[:, 0] + eps),
+        torch.max(pred_boxes[:, 3], pred_boxes[:, 1] + eps)
+    ], dim=1)
 
     # IoU
     iou = compute_iou(pred_boxes, target_boxes)
