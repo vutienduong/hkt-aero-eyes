@@ -279,8 +279,9 @@ def run_training(cfg):
                     logger.warning(f"  target_boxes range: [{target_bbox.min():.2f}, {target_bbox.max():.2f}]")
                     bbox_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-                # Total loss (scale by accumulation steps for proper averaging)
-                loss = (cls_loss + bbox_loss) / gradient_accumulation_steps
+                # Total loss with bbox loss weighting (scale by accumulation steps for proper averaging)
+                bbox_loss_weight = cfg["train"].get("bbox_loss_weight", 1.0)
+                loss = (cls_loss + bbox_loss_weight * bbox_loss) / gradient_accumulation_steps
 
             # Backward with gradient scaling for mixed precision
             scaler.scale(loss).backward()
@@ -440,7 +441,10 @@ def validate(model, val_loader, device, cls_criterion, cfg):
                 )
 
                 bbox_loss = giou_loss(bbox_preds_scaled, target_bbox)
-                loss = cls_loss + bbox_loss
+
+                # Apply same bbox loss weighting as training
+                bbox_loss_weight = cfg["train"].get("bbox_loss_weight", 1.0)
+                loss = cls_loss + bbox_loss_weight * bbox_loss
 
                 val_losses.append(loss.item())
 

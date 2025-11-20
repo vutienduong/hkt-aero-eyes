@@ -24,10 +24,11 @@ train:
   lr: 0.00001  # Target LR after warmup
   lr_warmup_steps: 500  # Warmup from 1e-6 to 1e-5 over 500 steps
   weight_decay: 0.0001
+  bbox_loss_weight: 2.0  # Increase bbox loss weight to force more bbox learning
   log_interval: 50
   val_interval: 2  # Validate every 2 epochs to save time
   checkpoint_dir: "checkpoints"
-  gradient_accumulation_steps: 1  # Increase to 2-4 for larger effective batch size
+  gradient_accumulation_steps: 2  # Effective batch = 128×2 = 256
 
 infer:
   confidence_threshold: 0.4
