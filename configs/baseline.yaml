@@ -8,7 +8,7 @@ data:
   train_split: "data/splits/train.txt"
   val_split: "data/splits/val.txt"
   batch_size: 512  # Optimized for A100 40GB - uses ~32-35GB (80-90% VRAM)
-  num_workers: 2  # Colab recommends max 2 workers for stability
+  num_workers: 4  # A100 Colab has more CPU resources, trying 4 workers for faster data loading
   template_images: ["img_1.jpg", "img_2.jpg", "img_3.jpg"]
 
 model:
