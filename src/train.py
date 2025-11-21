@@ -4,10 +4,97 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
+import re
+import glob
 from .data.aeroeyes_dataset import AeroEyesDataset
 from .data.transforms import AeroEyesTransform
 from .models.siam_tracker import SiamTracker
 from .utils.logging_utils import get_logger
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    """Find the latest checkpoint in the directory."""
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
+        return None
+
+    # Find all checkpoint files matching pattern: checkpoint_epoch{e}_step{s}.ckpt
+    checkpoints = list(checkpoint_dir.glob("checkpoint_epoch*_step*.ckpt"))
+    if not checkpoints:
+        return None
+
+    # Parse epoch and step from filenames and find the latest
+    latest_ckpt = None
+    latest_epoch = -1
+    latest_step = -1
+
+    for ckpt_path in checkpoints:
+        match = re.search(r'checkpoint_epoch(\d+)_step(\d+)\.ckpt', ckpt_path.name)
+        if match:
+            epoch = int(match.group(1))
+            step = int(match.group(2))
+            if epoch > latest_epoch or (epoch == latest_epoch and step > latest_step):
+                latest_epoch = epoch
+                latest_step = step
+                latest_ckpt = ckpt_path
+
+    return latest_ckpt
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device, logger):
+    """Load checkpoint and return start epoch and step."""
+    logger.info(f"Loading checkpoint from {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    start_epoch = checkpoint['epoch']
+    start_step = checkpoint.get('global_step', 0)
+    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+
+    logger.info(f"Resumed from Epoch {start_epoch}, Global Step {start_step}")
+    logger.info(f"Best validation loss so far: {best_val_loss:.4f}")
+
+    return start_epoch, start_step, best_val_loss
+
+
+def save_checkpoint(checkpoint_dir, epoch, global_step, model, optimizer, scheduler,
+                   train_loss, best_val_loss, logger, keep_last_n=3):
+    """Save checkpoint and cleanup old ones."""
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_path = checkpoint_dir / f"checkpoint_epoch{epoch}_step{global_step}.ckpt"
+
+    torch.save({
+        'epoch': epoch,
+        'global_step': global_step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'train_loss': train_loss,
+        'best_val_loss': best_val_loss,
+    }, checkpoint_path)
+
+    logger.info(f"Saved checkpoint: {checkpoint_path.name}")
+
+    # Cleanup old checkpoints, keep only last N
+    if keep_last_n > 0:
+        checkpoints = sorted(
+            checkpoint_dir.glob("checkpoint_epoch*_step*.ckpt"),
+            key=lambda p: (
+                int(re.search(r'epoch(\d+)', p.name).group(1)),
+                int(re.search(r'step(\d+)', p.name).group(1))
+            )
+        )
+
+        # Remove older checkpoints
+        for old_ckpt in checkpoints[:-keep_last_n]:
+            old_ckpt.unlink()
+            logger.info(f"Removed old checkpoint: {old_ckpt.name}")
 
 
 def compute_iou(boxes1, boxes2):
@@ -194,6 +281,42 @@ def run_training(cfg):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     best_val_loss = float('inf')
+    start_epoch = 0
+    global_step = 0
+
+    # Check for existing checkpoints and resume if requested
+    resume_mode = cfg["train"].get("resume_from_checkpoint", None)
+    if resume_mode:
+        latest_ckpt = find_latest_checkpoint(checkpoint_dir)
+
+        if latest_ckpt:
+            if resume_mode == "auto":
+                # Ask user if they want to resume
+                try:
+                    match = re.search(r'checkpoint_epoch(\d+)_step(\d+)\.ckpt', latest_ckpt.name)
+                    if match:
+                        ckpt_epoch = int(match.group(1))
+                        ckpt_step = int(match.group(2))
+                        logger.info(f"Found checkpoint: {latest_ckpt.name}")
+                        logger.info(f"Resume from Epoch {ckpt_epoch}, Step {ckpt_step}?")
+                        response = input("Enter 'y' to resume, 'n' to start fresh: ").strip().lower()
+
+                        if response == 'y':
+                            start_epoch, global_step, best_val_loss = load_checkpoint(
+                                latest_ckpt, model, optimizer, scheduler, device, logger
+                            )
+                        else:
+                            logger.info("Starting fresh training...")
+                except Exception as e:
+                    logger.warning(f"Error prompting for resume: {e}. Starting fresh...")
+
+            elif resume_mode == "latest":
+                # Auto-resume from latest
+                start_epoch, global_step, best_val_loss = load_checkpoint(
+                    latest_ckpt, model, optimizer, scheduler, device, logger
+                )
+        else:
+            logger.info("No checkpoint found. Starting training from scratch...")
 
     # Gradient accumulation settings
     gradient_accumulation_steps = cfg["train"].get("gradient_accumulation_steps", 1)
@@ -201,8 +324,12 @@ def run_training(cfg):
         logger.info(f"Using gradient accumulation with {gradient_accumulation_steps} steps")
         logger.info(f"Effective batch size: {cfg['data']['batch_size'] * gradient_accumulation_steps}")
 
+    # Checkpoint save settings
+    save_checkpoint_steps = cfg["train"].get("save_checkpoint_steps", 100)
+    keep_last_n = cfg["train"].get("keep_last_n_checkpoints", 3)
+
     # Training loop
-    for epoch in range(cfg["train"]["epochs"]):
+    for epoch in range(start_epoch, cfg["train"]["epochs"]):
         model.train()
         train_losses = []
         train_cls_losses = []
@@ -329,6 +456,15 @@ def run_training(cfg):
                     if warmup_steps > 0:
                         scheduler.step()
 
+                    # Increment global step and save checkpoint if needed
+                    global_step += 1
+
+                    if save_checkpoint_steps > 0 and global_step % save_checkpoint_steps == 0:
+                        save_checkpoint(
+                            checkpoint_dir, epoch + 1, global_step, model, optimizer, scheduler,
+                            actual_loss, best_val_loss, logger, keep_last_n
+                        )
+
             # Logging (multiply back to get actual loss for display)
             actual_loss = loss.item() * gradient_accumulation_steps
             train_losses.append(actual_loss)
@@ -368,15 +504,11 @@ def run_training(cfg):
                 torch.save(model.state_dict(), checkpoint_path)
                 logger.info(f"Saved best model to {checkpoint_path}")
 
-        # Save checkpoint
-        checkpoint_path = checkpoint_dir / f"epoch_{epoch+1}.ckpt"
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'train_loss': avg_train_loss,
-        }, checkpoint_path)
+        # Save epoch checkpoint
+        save_checkpoint(
+            checkpoint_dir, epoch + 1, global_step, model, optimizer, scheduler,
+            avg_train_loss, best_val_loss, logger, keep_last_n
+        )
 
         # Step scheduler only if not using warmup (warmup steps per batch)
         if warmup_steps == 0:

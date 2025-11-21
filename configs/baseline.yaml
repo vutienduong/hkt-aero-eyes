@@ -30,6 +30,11 @@ train:
   checkpoint_dir: "checkpoints"
   gradient_accumulation_steps: 1  # No accumulation needed with large batch_size=512
 
+  # Checkpoint settings
+  resume_from_checkpoint: "auto"  # "auto" (ask user), "latest" (auto-resume), null (start fresh)
+  save_checkpoint_steps: 100  # Save checkpoint every N steps
+  keep_last_n_checkpoints: 3  # Only keep last N checkpoints to save disk space
+
 infer:
   confidence_threshold: 0.4
   max_gap: 3
